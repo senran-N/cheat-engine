@@ -1,0 +1,2 @@
+openai>=1.0.0 # Standard OpenAI library
+# python-dotenv # Optional: for loading .env files if not using direct env vars
