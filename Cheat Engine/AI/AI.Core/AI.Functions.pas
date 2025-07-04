@@ -260,6 +260,32 @@ begin
   FuncDef.AddParameter('aob', 'string', 'The AOB pattern (e.g., "41 42 ?? 45").', True);
   RegisterFunction(FuncDef);
 
+  // Address List / Cheat Table functions
+  FuncDef := TAIFunctionDefinition.Create('addAddressToCheatTable', 'Adds an address to the Cheat Table.');
+  FuncDef.AddParameter('address', 'string', 'The memory address (e.g., "0x123ABC").', True);
+  FuncDef.AddParameter('type', 'string', 'The data type (e.g., "4 Bytes", "Float", "String").', True);
+  FuncDef.AddParameter('description', 'string', 'A description for this address entry.', False); // Optional description
+  RegisterFunction(FuncDef);
+
+  FuncDef := TAIFunctionDefinition.Create('getCheatTableEntries', 'Retrieves all entries from the current Cheat Table.');
+  // No parameters
+  RegisterFunction(FuncDef);
+
+  FuncDef := TAIFunctionDefinition.Create('setCheatTableEntryValue', 'Sets the value of a specific entry in the Cheat Table.');
+  FuncDef.AddParameter('index', 'integer', 'The index of the entry in the cheat table.', True);
+  FuncDef.AddParameter('value', 'string', 'The new value to set for the entry.', True);
+  RegisterFunction(FuncDef);
+
+  FuncDef := TAIFunctionDefinition.Create('setCheatTableEntryDescription', 'Sets the description of a specific entry in the Cheat Table.');
+  FuncDef.AddParameter('index', 'integer', 'The index of the entry in the cheat table.', True);
+  FuncDef.AddParameter('description', 'string', 'The new description for the entry.', True);
+  RegisterFunction(FuncDef);
+
+  FuncDef := TAIFunctionDefinition.Create('toggleFreezeAddress', 'Toggles the freeze state of a specific entry in the Cheat Table.');
+  FuncDef.AddParameter('index', 'integer', 'The index of the entry in the cheat table.', True);
+  FuncDef.AddParameter('freeze', 'boolean', 'True to freeze the address, False to unfreeze.', True);
+  RegisterFunction(FuncDef);
+
 end;
 
 function AIFunctions: TAIFunctionRegistry;
