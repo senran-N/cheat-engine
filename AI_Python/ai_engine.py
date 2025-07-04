@@ -22,6 +22,7 @@ LOG_FILE_PATH = os.path.join(os.path.dirname(__file__), "ai_engine.log")
 client = None
 conversation_history = []
 available_tools = [] # Will be populated by Pascal side via a system_init message
+active_scan_tasks = {} # Stores info about ongoing scans, e.g., {task_id: {"status": "polling_status", "next_action_prompt": "..."}}
 
 # Placeholder for function definitions that Pascal will send
 # Example structure:
@@ -228,16 +229,144 @@ def handle_function_call_result(data):
     # Content for the 'tool' role message should be the result of the tool call.
     # OpenAI expects this content to be a string.
     # If status is error, the error_msg is more relevant. Otherwise, result_data_str.
-    tool_content = ""
+    tool_response_content = ""
     if status == "success":
-        tool_content = result_data_str # This is the JSON string from Pascal
+        tool_response_content = result_data_str # This is the JSON string from Pascal
     else:
-        tool_content = f"Error executing function: {error_msg}"
+        tool_response_content = f"Error executing function: {error_msg}"
         if result_data_str and result_data_str != '{}': # include data if any
-             tool_content += f" (Details: {result_data_str})"
+             tool_response_content += f" (Details: {result_data_str})"
 
-    add_to_conversation(role="tool", content=tool_content, tool_call_id=tool_call_id, name=function_name)
+    add_to_conversation(role="tool", content=tool_response_content, tool_call_id=tool_call_id, name=function_name)
 
+    # --- Asynchronous Scan Flow Logic ---
+    # This logic decides if we need to make another automatic function call (e.g. getScanStatus -> getScanResults)
+    # or if we should go back to the AI for the next step.
+
+    should_call_ai_again = True
+    pending_follow_up_call = None
+
+    if function_name == "startFirstScan" and status == "success":
+        try:
+            task_info = json.loads(result_data_str) # result_data_str should be like '{"task_id": "scan_1"}'
+            new_task_id = task_info.get("task_id")
+            if new_task_id:
+                active_scan_tasks[new_task_id] = {"status": "started", "original_request_id": request_id}
+                log_message(f"Scan task {new_task_id} started and tracked.")
+                # AI should be prompted to check status. For now, let's make Python auto-request status.
+                # To make the AI decide, the tool_response_content would need to guide it.
+                # Here, we are overriding the immediate call to AI with another tool call.
+                pending_follow_up_call = {
+                    "message_type": "function_call_request",
+                    "function_name": "getScanStatus",
+                    "parameters": {"task_id": new_task_id},
+                    "request_id": request_id, # Re-use original request_id for context
+                    "tool_call_id": f"follow_up_{tool_call_id}_status" # New synthetic tool_call_id
+                }
+                should_call_ai_again = False # We are making a direct follow-up tool call
+                log_message(f"Automatically requesting getScanStatus for task {new_task_id}.")
+        except json.JSONDecodeError:
+            log_message(f"Error parsing task_id from startFirstScan result: {result_data_str}")
+            # Fall through to let AI handle the raw (likely error) message.
+
+    elif function_name == "getScanStatus" and status == "success":
+        try:
+            status_info = json.loads(result_data_str)
+            scan_task_id = None
+            # Find the task_id from the original request parameters in conversation_history.
+            # The 'tool_call_id' is for the getScanStatus call itself.
+            # We need the task_id that was a parameter to getScanStatus.
+            # This requires looking up the parameters of the current tool_call_id's request.
+            # For simplicity, let's assume the AI is somewhat aware or we can retrieve it.
+            # A robust way: Python side keeps track of which tool_call_id maps to which original function call & params.
+            # Let's find the last function call with name 'getScanStatus' and get its task_id from the arguments
+            # This is a bit hacky, better to pass task_id along if possible or manage state more explicitly.
+
+            # Simplified: Assume AI will pass task_id if it calls getScanResults next.
+            # Or, let's try to find the task_id from the parameters of the *current* tool call that *led* to this result.
+            # The `tool_call_id` corresponds to the call for `getScanStatus`.
+            # We need to find the parameters sent for this call.
+            # This info is in `conversation_history` if we search for the assistant message that made this tool_call_id.
+
+            current_task_id_param = None
+            for msg_idx in range(len(conversation_history) - 2, -1, -1): # Search backwards from message before current "tool" response
+                msg = conversation_history[msg_idx]
+                if msg["role"] == "assistant" and msg.get("tool_calls"):
+                    for tc in msg["tool_calls"]:
+                        if tc["id"] == tool_call_id and tc["function"]["name"] == "getScanStatus":
+                            args = json.loads(tc["function"]["arguments"])
+                            current_task_id_param = args.get("task_id")
+                            break
+                    if current_task_id_param:
+                        break
+
+            if current_task_id_param:
+                log_message(f"Retrieved task_id '{current_task_id_param}' for getScanStatus result.")
+                task_current_status = status_info.get("status")
+                if task_current_status == "completed":
+                    if current_task_id_param in active_scan_tasks:
+                        active_scan_tasks[current_task_id_param]["status"] = "completed"
+                    pending_follow_up_call = {
+                        "message_type": "function_call_request",
+                        "function_name": "getScanResults",
+                        "parameters": {"task_id": current_task_id_param, "offset": 0, "count": 20}, # Default count
+                        "request_id": request_id,
+                        "tool_call_id": f"follow_up_{tool_call_id}_results"
+                    }
+                    should_call_ai_again = False
+                    log_message(f"Scan {current_task_id_param} completed. Automatically requesting getScanResults.")
+                elif task_current_status == "running":
+                    # Let AI decide what to do (e.g. inform user, wait, poll again)
+                    # The tool_response_content will contain the 'running' status and progress.
+                    log_message(f"Scan {current_task_id_param} is still running. Progress: {status_info.get('progress')}")
+                    # AI will see this and can decide to call getScanStatus again.
+                elif task_current_status == "error":
+                    if current_task_id_param in active_scan_tasks:
+                        del active_scan_tasks[current_task_id_param]
+                    log_message(f"Scan {current_task_id_param} resulted in an error: {status_info.get('error_message')}")
+                    # Let AI inform the user based on tool_response_content.
+                # Other statuses like 'pending', 'cancelled' will also fall through to AI.
+            else:
+                log_message("Could not determine task_id for getScanStatus result to automate getScanResults.")
+
+        except json.JSONDecodeError:
+            log_message(f"Error parsing status_info from getScanStatus result: {result_data_str}")
+            # Fall through to let AI handle it.
+
+    elif function_name == "getScanResults" and status == "success":
+        # After getting results, the AI should inform the user.
+        # The current tool_response_content contains the results.
+        # We might want to suggest calling clearScan.
+        # For now, just remove from active_scan_tasks if we can identify it.
+        # Similar logic to getScanStatus for finding task_id if needed for state cleanup.
+        current_task_id_param = None # Simplified, find task_id as above if needed
+        # ... (logic to find task_id from history if required for active_scan_tasks cleanup)
+        # if current_task_id_param and current_task_id_param in active_scan_tasks:
+        #    del active_scan_tasks[current_task_id_param]
+        #    log_message(f"Scan task {current_task_id_param} results received and task removed from active tracking.")
+        pass # Let AI handle the results.
+
+    elif function_name == "clearScan" and status == "success":
+        # Task cleared, remove from tracking if we had it.
+        # Similar logic to getScanStatus for finding task_id if needed for state cleanup.
+        pass # Let AI handle the confirmation.
+
+
+    if pending_follow_up_call:
+        send_response(pending_follow_up_call)
+        # We don't add this synthetic follow-up to conversation history for the AI,
+        # as the AI didn't request it. Pascal will send a result for it.
+        # The next function_call_result handler will process it.
+        return # Skip calling AI again for now.
+
+    if not should_call_ai_again:
+        # This case should ideally not be hit if pending_follow_up_call is handled.
+        # But as a safeguard, if we decided not to call AI and didn't have a follow-up,
+        // it means the Python script is taking over the flow entirely for a step.
+        log_message("Decided not to call AI and no pending follow-up. Flow might be handled by Python logic.")
+        return
+
+    # Default: Call AI with the tool's response to get next step or final answer
     try:
         log_message(f"Calling OpenAI with tool result. History: {json.dumps(conversation_history[-5:])}")
 

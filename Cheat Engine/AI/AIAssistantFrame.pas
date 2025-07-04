@@ -221,7 +221,46 @@ begin
     if FPythonBridge.Start(APythonExecutable, ScriptFullPath, EnvStrings) then
     begin
       LogToConversation('Python Bridge started successfully.', clGreen);
-    lblStatus.Caption := 'Status: AI Ready';
+      lblStatus.Caption := 'Status: AI Python process running.';
+
+      // Send system_init message with function definitions
+      LogToConversation('Sending function definitions to AI Engine...', clGray);
+      Dim FuncSchemasJsonString: string = AIFunctions.GetAllFunctionsSchemaJson();
+      Dim SystemInitJsonObj: TJSONObject;
+      Dim ToolsJsonArray: TJSONArray;
+      Dim SystemInitMessageString: string;
+
+      try
+        // Parse the schemas string into a TJSONArray to ensure it's valid and to embed it correctly
+        ToolsJsonArray := TJSONParser.Create(FuncSchemasJsonString).Parse as TJSONArray; // Ownership by parser then by SystemInitJsonObj
+
+        SystemInitJsonObj := TJSONObject.Create;
+        SystemInitJsonObj.Add('message_type', 'system_init');
+        SystemInitJsonObj.Add('tools', ToolsJsonArray); // ToolsJsonArray is now owned by SystemInitJsonObj
+
+        SystemInitMessageString := SystemInitJsonObj.AsJSON; // Compact JSON
+        FPythonBridge.SendMessageToPython(SystemInitMessageString);
+        LogToConversation('Function definitions sent to AI Engine.', clGreen);
+        lblStatus.Caption := 'Status: AI Ready';
+      except
+        on E: Exception do
+        begin
+          LogToConversation('Error preparing or sending function definitions: ' + E.Message, clRed);
+          lblStatus.Caption := 'Status: Error - AI Init Failed (tools)';
+        end;
+        // SystemInitJsonObj might not be assigned or ToolsJsonArray might not if error before creation
+        // If SystemInitJsonObj was created, it needs freeing if not passed to SendMessageToPython
+        // However, AsJSON is called before SendMessageToPython, so SystemInitJsonObj should be valid if no exception.
+        // If an exception occurs during Add or AsJSON, fpJSON objects might need manual cleanup if not fully constructed.
+        // TJSONObject.Create and then Add(TJSONData) makes the parent own the child.
+        // Freeing the root (SystemInitJsonObj) would free children.
+        // If parsing ToolsJsonArray fails, it won't be added.
+        // For simplicity here, assuming SystemInitJsonObj.Free in a finally block if it was assigned.
+        // More robustly:
+        if Assigned(SystemInitJsonObj) then SystemInitJsonObj.Free; // Free if created and an error occurred before sending.
+                                                                  // Note: if Add('tools', ToolsJsonArray) succeeded, ToolsJsonArray is owned.
+                                                                  // If parsing FuncSchemasJsonString failed, ToolsJsonArray is not assigned.
+      end;
   end
   else
   begin
